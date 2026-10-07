@@ -11,7 +11,7 @@
 /* ---- guest memory map ------------------------------------------------------ */
 #define MEM1_BASE 0xF4000000u
 #define MEM1_SIZE 0x02000000u
-#define MEM2_BASE 0x10400000u /* above the loaded RPX */
+#define MEM2_BASE g_mem2_base /* above every loaded RPX data section */
 #define MEM2_END  0x4E000000u /* main stack lives above */
 #define FG_BASE   0xE0000000u
 #define FG_SIZE   0x02800000u
@@ -21,7 +21,9 @@
 #define TIMER_HZ 62156250ull /* bus clock / 4 */
 
 static uint32_t g_sys_brk = SYS_BASE;
-static uint32_t sys_alloc(uint32_t size) {
+static uint32_t g_mem2_base;
+uint32_t hle_sys_alloc(uint32_t size) {
+    if(size>0x10000000u-g_sys_brk-63u)rt_fatal(NULL,"runtime system arena exhausted");
     uint32_t a = g_sys_brk;
     g_sys_brk = (g_sys_brk + size + 63) & ~63u;
     memset(g_mem + a, 0, size);
@@ -43,7 +45,7 @@ typedef struct heap {
     struct heap *next;
 } heap;
 static heap *g_heaps;
-static uint32_t g_base_heap[3]; /* MEM1, MEM2, FG */
+static uint32_t g_base_heap[9]; /* Cemu coreinit_Init: MEM1=0, MEM2=1, FG=8 */
 
 static heap *heap_get(uint32_t handle) {
     for (heap *h = g_heaps; h; h = h->next)
@@ -211,7 +213,7 @@ static void MEMGetAllocatableSizeForFrmHeapEx(ppc_ctx *c) {
     RET(a < h->tail ? h->tail - a : 0);
 }
 
-static void MEMGetBaseHeapHandle(ppc_ctx *c) { RET(ARG(0) < 3 ? g_base_heap[ARG(0)] : 0); }
+static void MEMGetBaseHeapHandle(ppc_ctx *c) { RET(ARG(0) < 9 ? g_base_heap[ARG(0)] : 0); }
 
 /* MEMAllocator { funcs*, heap, align, 0 } */
 static void MEMInitAllocatorForExpHeap(ppc_ctx *c) {
@@ -250,6 +252,7 @@ static void OSGetForegroundBucketFreeArea(ppc_ctx *c) {
 
 /* ---- system / time ---------------------------------------------------------------- */
 static uint32_t g_sysinfo, g_main_thread;
+void hle_attach_main(ppc_ctx *c) { hle_thread_attach(c, g_main_thread); }
 static uint64_t g_ticks_since_2000_at_boot;
 static struct timespec g_boot;
 
@@ -269,8 +272,7 @@ static void OSGetMainCoreId(ppc_ctx *c) { RET(1); }
 static void OSIsDebuggerInitialized(ppc_ctx *c) { RET(0); }
 static void bspGetHardwareVersion(ppc_ctx *c) { RET(0x21201000); /* retail Cafe */ }
 
-/* ---- threads & sync (single guest thread for now) ------------------------------- */
-static void OSGetCurrentThread(ppc_ctx *c) { RET(g_main_thread); }
+/* ---- simple return helpers --------------------------------------------------- */
 static void Ret0(ppc_ctx *c) { RET(0); }
 static void Ret1(ppc_ctx *c) { RET(1); }
 static void Nop(ppc_ctx *c) { (void)c; }
@@ -299,10 +301,13 @@ static void OSDynLoad_Acquire(ppc_ctx *c) {
 }
 static void OSDynLoad_FindExport(ppc_ctx *c) {
     const char *name = gstr(ARG(2));
-    uint32_t t = hle_thunk_addr(name);
+    uint32_t module = ARG(0) - 0x1000;
+    const char *lib = module < (uint32_t)g_nmodules ? g_modules[module] : "?";
+    uint32_t t = ARG(1) ? 0 : hle_export_addr(lib, name);
     fprintf(stderr, "OSDynLoad_FindExport(%s, data=%u, %s) -> %08x\n",
             (ARG(0) - 0x1000) < (uint32_t)g_nmodules ? g_modules[ARG(0) - 0x1000] : "?", ARG(1), name, t);
     st32(ARG(3), t);
+    if(getenv("WIIU_TRACE_EXPORTS"))fprintf(stderr,"export caller=%08x output=%08x result=%08x\n",c->lr,ARG(3),t?0:0xFFFCFFE9u);
     RET(t ? 0 : 0xFFFCFFE9);
 }
 
@@ -333,13 +338,6 @@ static const struct { const char *lib, *name; hle_fn fn; } k_hle[] = {
     {"coreinit", "OSGetMainCoreId", OSGetMainCoreId},
     {"coreinit", "OSIsDebuggerInitialized", OSIsDebuggerInitialized},
     {"coreinit", "bspGetHardwareVersion", bspGetHardwareVersion},
-    {"coreinit", "OSGetCurrentThread", OSGetCurrentThread},
-    {"coreinit", "OSInitMutex", Nop},
-    {"coreinit", "OSLockMutex", Nop},
-    {"coreinit", "OSUnlockMutex", Nop},
-    {"coreinit", "OSTryLockMutex", Ret1},
-    {"coreinit", "__ghsLock", Nop},
-    {"coreinit", "__ghsUnlock", Nop},
     {"coreinit", "OSDisableInterrupts", Ret1},
     {"coreinit", "OSRestoreInterrupts", Nop},
     {"coreinit", "DCFlushRange", Nop},
@@ -359,20 +357,61 @@ static const struct { const char *lib, *name; hle_fn fn; } k_hle[] = {
 #define N_HLE (sizeof k_hle / sizeof *k_hle)
 
 hle_fn hle_lookup(const char *lib, const char *name) {
+    char normalized[64];
+    size_t len = strlen(lib);
+    if (len > 4 && len < sizeof normalized && !strcmp(lib + len - 4, ".rpl")) {
+        memcpy(normalized, lib, len - 4); normalized[len - 4] = 0; lib = normalized;
+    }
+    if (!strcmp(lib, "h264")) return hle_h264_lookup(name);
+    if (!strcmp(lib, "snd_core")) return hle_audio_lookup(name);
+    if (!strcmp(lib, "nn_save")) return hle_save_lookup(name);
+    if (!strcmp(lib, "nn_act")) return hle_account_lookup(name);
+    if (!strcmp(lib, "vpad")||!strcmp(lib,"padscore")) return hle_input_lookup(name);
+    if (!strcmp(lib, "swkbd")) return hle_swkbd_lookup(name);
+    if (!strcmp(lib, "erreula")) return hle_erreula_lookup(name);
+    if (!strcmp(lib, "dmae")) return hle_dmae_lookup(name);
+    if (!strcmp(lib, "gx2")) {
+        hle_fn fn = hle_gpu_validate_lookup(name);
+        if (fn) return fn;
+        fn = hle_gx2_fetch_lookup(name);
+        if (fn) return fn;
+        fn = hle_gx2_sampler_lookup(name);
+        return fn ? fn : hle_gx2_lookup(name);
+    }
+    if (!strcmp(lib, "coreinit")) {
+        hle_fn fn = hle_alarm_lookup(name);
+        if (fn) return fn;
+        fn = hle_thread_lookup(name);
+        if (fn) return fn;
+        fn = hle_ipcbuf_lookup(name);
+        if (fn) return fn;
+        fn = hle_fs_lookup(name);
+        if (fn) return fn;
+    }
     for (size_t i = 0; i < N_HLE; i++)
         if (!strcmp(k_hle[i].lib, lib) && !strcmp(k_hle[i].name, name)) return k_hle[i].fn;
     return NULL;
 }
 
 /* Thunks: guest-callable addresses for HLE functions reached through pointers. */
+static hle_fn g_thunks[4096];
+static uint32_t g_nthunks;
 uint32_t hle_thunk_addr(const char *name) {
-    for (size_t i = 0; i < N_HLE; i++)
-        if (!strcmp(k_hle[i].name, name)) return THUNK_BASE + 4 * (uint32_t)i;
-    return 0;
+    return hle_export_addr("coreinit", name);
+}
+uint32_t hle_export_addr(const char *lib, const char *name) {
+    hle_fn fn = hle_lookup(lib, name);
+    if (!fn) return 0;
+    for (uint32_t i = 0; i < g_nthunks; i++)
+        if (g_thunks[i] == fn) return THUNK_BASE + 4 * i;
+    if (g_nthunks == 4096) rt_fatal(NULL, "HLE thunk table full");
+    g_thunks[g_nthunks] = fn;
+    return THUNK_BASE + 4 * g_nthunks++;
 }
 int hle_call_thunk(ppc_ctx *c, uint32_t addr) {
-    if (addr < THUNK_BASE || addr >= THUNK_BASE + 4 * N_HLE) return 0;
-    k_hle[(addr - THUNK_BASE) / 4].fn(c);
+    if (addr < THUNK_BASE || addr >= THUNK_BASE + 4 * g_nthunks || (addr & 3)) return 0;
+    hle_thread_poll(c);
+    g_thunks[(addr - THUNK_BASE) / 4](c);
     return 1;
 }
 
@@ -384,10 +423,13 @@ void hle_init_data_import(uint32_t addr, const char *name) {
 }
 
 void hle_init(void) {
+    g_mem2_base = (g_loaded_data_end + 0xFFFFu) & ~0xFFFFu;
+    if (g_mem2_base < 0x10400000u) g_mem2_base = 0x10400000u;
+    if (g_mem2_base >= MEM2_END) rt_fatal(NULL, "RPX data leaves no room for MEM2 heap");
     clock_gettime(CLOCK_MONOTONIC, &g_boot);
     g_ticks_since_2000_at_boot = (uint64_t)(time(NULL) - 946684800) * TIMER_HZ;
 
-    g_sysinfo = sys_alloc(0x20);
+    g_sysinfo = hle_sys_alloc(0x20);
     st32(g_sysinfo + 0, 248625000);   /* bus clock */
     st32(g_sysinfo + 4, 1243125000);  /* core clock */
     st64(g_sysinfo + 8, g_ticks_since_2000_at_boot);
@@ -396,10 +438,10 @@ void hle_init(void) {
     st32(g_sysinfo + 0x18, 512 * 1024);
     st32(g_sysinfo + 0x1C, 5);
 
-    g_main_thread = sys_alloc(0x6A0);
+    g_main_thread = hle_sys_alloc(0x6A0);
     st32(g_main_thread + 0x320, 0x74487244); /* 'tHrD' */
 
     g_base_heap[0] = frm_create(MEM1_BASE, MEM1_SIZE);
     g_base_heap[1] = exp_create(MEM2_BASE, MEM2_END - MEM2_BASE);
-    g_base_heap[2] = frm_create(FG_BASE, FG_SIZE);
+    g_base_heap[8] = frm_create(FG_BASE + 0x00800000, FG_SIZE - 0x00800000);
 }

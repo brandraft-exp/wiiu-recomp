@@ -16,6 +16,7 @@
 #include "rt.h"
 
 uint8_t *g_mem;
+uint32_t g_loaded_data_end;
 
 extern const struct { uint32_t addr; ppc_fn fn; } g_fn_table[];
 extern const size_t g_fn_count;
@@ -24,10 +25,15 @@ extern const struct { uint32_t addr; const char *lib, *name; int is_data; } g_im
 extern const size_t g_import_count;
 extern const struct { uint32_t addr; int id; } g_tramps[];
 extern const size_t g_tramp_count;
+extern const struct { uint32_t addr; const char *name; } g_data_aliases[];
+extern const size_t g_data_alias_count;
 
 static ppc_fn *g_fn_index; /* (addr - g_text_lo) / 4 -> fn */
 static unsigned long g_import_calls;
 int g_trace_imports = 1;
+static const char *g_stop_before;
+static int g_strict_imports;
+static unsigned long g_max_imports;
 
 void rt_fatal(ppc_ctx *c, const char *fmt, ...) {
     va_list ap;
@@ -39,6 +45,7 @@ void rt_fatal(ppc_ctx *c, const char *fmt, ...) {
         fprintf(stderr, "\n    lr=%08x r1=%08x r3=%08x r4=%08x r5=%08x r6=%08x\n", c->lr, c->r[1], c->r[3],
                 c->r[4], c->r[5], c->r[6]);
     fprintf(stderr, "    after %lu import calls\n", g_import_calls);
+    hle_thread_dump();
     exit(2);
 }
 
@@ -84,13 +91,28 @@ int rt_import_by_addr(uint32_t addr) {
 const char *rt_import_name(int id) { return g_imports[id].name; }
 
 void ppc_import(ppc_ctx *c, int id) {
+    hle_thread_poll(c);
     g_import_calls++;
+    if (g_max_imports && g_import_calls > g_max_imports)
+        rt_fatal(c, "diagnostic import limit reached (%lu)", g_max_imports);
+    if (g_stop_before) {
+        char name[256];
+        snprintf(name, sizeof name, "%s.%s", g_imports[id].lib, g_imports[id].name);
+        if (!strcmp(name, g_stop_before)) {
+            fprintf(stderr, "BOOT CHECKPOINT: %s after %lu import calls\n", name, g_import_calls);
+            exit(0);
+        }
+    }
     hle_fn h = hle_lookup(g_imports[id].lib, g_imports[id].name);
     if (g_trace_imports)
         fprintf(stderr, "[%6lu] %s%s.%s(%08x, %08x, %08x, %08x) lr=%08x\n", g_import_calls, h ? "" : "STUB ",
                 g_imports[id].lib, g_imports[id].name, c->r[3], c->r[4], c->r[5], c->r[6], c->lr);
     if (h) h(c);
-    else c->r[3] = 0;
+    else {
+        if (g_strict_imports)
+            rt_fatal(c, "unimplemented import %s.%s", g_imports[id].lib, g_imports[id].name);
+        c->r[3] = 0;
+    }
 }
 
 /* ---- loader ----------------------------------------------------------------- */
@@ -126,6 +148,11 @@ static void load_rpx(const char *path) {
             continue;
         }
         if (!addr || !size || addr >= 0xC0000000u) continue; /* metadata / import placeholders */
+        uint32_t mem_size = (flags & 0x08000000) && type == 1 ? be32(raw + off) : size;
+        if ((type == 1 || type == 8) && addr >= 0x10000000u && addr < 0x80000000u) {
+            if (mem_size > 0x80000000u - addr) { fprintf(stderr, "invalid data section size\n"); exit(1); }
+            if (addr + mem_size > g_loaded_data_end) g_loaded_data_end = addr + mem_size;
+        }
         if (type == 8) { memset(g_mem + addr, 0, size); continue; } /* NOBITS */
         if (type != 1) continue;
         if (flags & 0x08000000) { /* RPL_ZLIB */
@@ -162,6 +189,8 @@ static void on_segv(int sig, siginfo_t *si, void *uc) {
 static void init_data_imports(void) {
     for (size_t i = 0; i < g_import_count; i++)
         if (g_imports[i].is_data) hle_init_data_import(g_imports[i].addr, g_imports[i].name);
+    for (size_t i = 0; i < g_data_alias_count; i++)
+        hle_init_data_import(g_data_aliases[i].addr, g_data_aliases[i].name);
 }
 
 static void build_fn_index(void) {
@@ -171,7 +200,46 @@ static void build_fn_index(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s <file.rpx> [entry-hex]\n", argv[0]); return 1; }
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <file.rpx> [entry-hex] [--quiet] [--strict-imports] [--stop-before library.function]\n", argv[0]);
+        fprintf(stderr, "       [--content-base dir] [--content-update dir] [--save-dir existing-dir]\n");
+        fprintf(stderr, "       [--debug-overlay] [--max-imports count] [--input-replay FILE] [--keyboard-replay FILE]\n");
+        return 1;
+    }
+    uint32_t entry_override = 0;
+    const char *content_base = NULL, *content_update = NULL, *save_dir = NULL;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--quiet")) g_trace_imports = 0;
+        else if (!strcmp(argv[i], "--strict-imports")) g_strict_imports = 1;
+        else if (!strcmp(argv[i], "--stop-before") && i + 1 < argc) g_stop_before = argv[++i];
+        else if (!strcmp(argv[i], "--content-base") && i + 1 < argc) content_base = argv[++i];
+        else if (!strcmp(argv[i], "--content-update") && i + 1 < argc) content_update = argv[++i];
+        else if (!strcmp(argv[i], "--save-dir") && i + 1 < argc) save_dir = argv[++i];
+        else if (!strcmp(argv[i], "--input-replay") && i+1<argc) hle_input_replay(argv[++i]);
+        else if (!strcmp(argv[i], "--keyboard-replay") && i+1<argc) hle_text_replay(argv[++i]);
+        else if (!strcmp(argv[i], "--audio")) hle_audio_enable();
+        else if (!strcmp(argv[i], "--debug-overlay")) hle_debug_overlay_enable();
+        else if (!strcmp(argv[i], "--window")) hle_window_enable();
+        else if (!strcmp(argv[i], "--gpu-render") && i + 1 < argc) hle_gpu_render_configure(argv[++i]);
+        else if (!strcmp(argv[i], "--gpu-validate") && i + 1 < argc) hle_gpu_validate_configure(argv[++i]);
+        else if (!strcmp(argv[i], "--max-imports") && i + 1 < argc) {
+            char *end;
+            const char *value = argv[++i];
+            g_max_imports = strtoul(value, &end, 10);
+            if (!*value || *end || *value == '-' || !g_max_imports) {
+                fprintf(stderr, "invalid import limit: %s\n", value); return 1;
+            }
+        }
+        else {
+            char *end;
+            unsigned long entry = strtoul(argv[i], &end, 16);
+            if (!*argv[i] || *end || entry > UINT32_MAX || !entry || entry_override) {
+                fprintf(stderr, "invalid argument: %s\n", argv[i]); return 1;
+            }
+            entry_override = (uint32_t)entry;
+        }
+    }
+    hle_fs_configure(content_base, content_update, save_dir);
     map_guest();
     load_rpx(argv[1]);
     build_fn_index();
@@ -187,6 +255,7 @@ int main(int argc, char **argv) {
     sigaction(SIGBUS, &sa, NULL);
 
     ppc_ctx *c = calloc(1, sizeof(ppc_ctx));
+    hle_attach_main(c);
     uint32_t stack_top = RT_STACK_TOP;
     c->r[1] = stack_top - 0x20;
     c->r[2] = g_sda2_base;
@@ -194,7 +263,7 @@ int main(int argc, char **argv) {
     c->r[3] = 0; /* argc */
     c->r[4] = 0; /* argv */
     c->lr = 0;
-    uint32_t entry = argc > 2 ? (uint32_t)strtoul(argv[2], NULL, 16) : rt_entry_point();
+    uint32_t entry = entry_override ? entry_override : rt_entry_point();
     fprintf(stderr, "entry %08x  r1=%08x r2=%08x r13=%08x  (%zu functions)\n", entry, c->r[1], c->r[2], c->r[13],
             g_fn_count);
     ppc_call_indirect(c, entry);

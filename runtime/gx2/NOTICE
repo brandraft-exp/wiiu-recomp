@@ -1,0 +1,29 @@
+Cemu contributors, https://github.com/cemu-project/Cemu
+Revision: fced55a9dee09292587d509c30904494d4f6e8f2
+MPL-2.0; see LICENSE-MPL-2.0.
+
+addr.cpp and addr.h: src/Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.cpp/.h
+coord.cpp: src/Cafe/HW/Latte/LatteAddrLib/LatteAddrLib_Coord.cpp
+formats.h: format/dimension/tile enums and helpers from src/Cafe/HW/Latte/ISA/LatteReg.h
+surface.cpp: GX2CalculateSurfaceInfo, _CalculateLevels, _GX2AdjustLevelCount,
+GX2CalcSurfaceSizeAndAlignment from src/Cafe/OS/libs/gx2/GX2_Surface.cpp.
+
+Modifications: standalone includes and integer types; host-endian surface struct;
+C bridge and input validation; game-specific FFL workaround omitted.
+Coordinate bit scan uses __builtin_clz on the 32-bit operand (not clzl).
+Aperture bridge follows GX2_TilingAperture.cpp::retileTexture with bounds checks.
+
+Standalone OpenGL shader translation in decompiler/:
+- LatteDecompiler*.cpp/.h, LatteDecompilerEmitGLSLHeader.hpp:
+  src/Cafe/HW/Latte/LegacyShaderDecompiler/ (same basenames)
+- FetchShader.cpp/.h, LatteConst.h, LatteShaderAssembly.h, LatteShader.h,
+  LatteGSCopyShaderParser.cpp: src/Cafe/HW/Latte/Core/ (same basenames)
+- registers.h: remaining register definitions from ISA/LatteReg.h
+- RegDefines.h and LatteInstructions.h: src/Cafe/HW/Latte/ISA/
+- inputs.cpp: Core/LatteShader.cpp::LatteShader_CreatePSInputTable.
+Adaptations: standalone includes/types, standard vectors replacing Boost vectors,
+OpenGL-only renderer selection, Metal framebuffer-fetch analysis omitted, no Cemu
+performance instrumentation or native fetch-shader cache/Vulkan hash, owned fetch
+attribute arrays, thread-local pixel input table. StringBuf.h is a new growing
+std::string adapter, avoiding the original fixed-buffer formatting limit.
+No game shader programs or generated shader text are included.

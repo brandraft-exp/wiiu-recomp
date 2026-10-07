@@ -15,11 +15,14 @@ import collections
 import os
 import struct
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 import rpxinfo  # noqa: E402
 
 from recomp import insn  # noqa: E402
+from recomp.discovery import discover
+from recomp.build import write_build
 
 R_PPC_ADDR32, R_PPC_ADDR16_LO, R_PPC_ADDR16_HA, R_PPC_REL24 = 1, 4, 6, 10
 
@@ -32,16 +35,46 @@ class Program:
         self.lo, self.hi = self.text.addr, self.text.addr + len(self.text.data)
         self.syms = self.rpx.symbols
         self._imports()
-        self._functions()
         self._relocs()
+        self.sorted_code_refs = sorted(self.data_code_refs | self.code_addr_refs)
+        self._functions()
         self._entries()
+        self.validate()
+
+    def validate(self):
+        """Reject overlapping/gapped partitions and split conditional branches."""
+        end = self.lo
+        for start, size in self.funcs:
+            if start != end or size <= 0 or size % 4:
+                raise ValueError('invalid code partition at %08x (expected %08x)' % (start, end))
+            end = start + size
+            if self.discovered_entries:
+                for a in range(start, end, 4):
+                    b = insn.branch_info(self.word(a), a)
+                    if b and b['kind'] == 'b' and not b['lk'] and not is_uncond(b):
+                        tgt = self.rel24.get(a, b['target'])
+                        if self.lo <= tgt < self.hi and not start <= tgt < end:
+                            raise ValueError('conditional branch crosses body: %08x -> %08x' % (a, tgt))
+        if end != self.hi:
+            raise ValueError('code partition does not cover .text')
 
     def _entries(self):
         """Direct call/jump targets that land inside another function (multi-entry helpers)."""
         self.entries = collections.defaultdict(set)  # function start -> extra entry addresses
+        candidates = set(self.discovered_entries)
         for start, size in self.funcs:
-            for a in range(start, start + size, 4):
-                b = insn.branch_info(self.word(a), a)
+            run = []
+            for a in range(start, start + size + 4, 4):
+                w = self.word(a) if a < start + size else 0
+                if (w >> 26) == 18 and not (w & 3):
+                    run.append(a)
+                else:
+                    if len(run) >= 3:
+                        candidates.update(run)
+                    run = []
+                if a == start + size:
+                    continue
+                b = insn.branch_info(w, a)
                 if not b or b["kind"] != "b":
                     continue
                 tgt = self.rel24.get(a, b["target"])
@@ -50,6 +83,13 @@ class Program:
                 f = self.func_containing(tgt)
                 if f and tgt != f[0]:
                     self.entries[f[0]].add(tgt)
+        # A stripped-code partition can begin at a branch-table base. Its
+        # dispatching bctr then lives in a different body; every table slot
+        # must be globally callable, not only a case in the table body's switch.
+        for tgt in candidates:
+            f = self.func_containing(tgt)
+            if f and tgt != f[0]:
+                self.entries[f[0]].add(tgt)
         self.entry_set = {e for es in self.entries.values() for e in es}
 
     def callable(self, addr):
@@ -81,6 +121,7 @@ class Program:
                     self.rpx.sections[s["shndx"]] is self.text and s["size"]:
                 sized[s["value"]] = max(sized.get(s["value"], 0), s["size"])
         starts = sorted(sized)
+        self.discovered_entries = set()
         funcs = []
         prev_end = self.lo
         for a in starts:
@@ -91,6 +132,8 @@ class Program:
             prev_end = max(prev_end, end)
         if prev_end < self.hi:
             funcs.append((prev_end, self.hi - prev_end))
+        if not sized:
+            funcs, self.discovered_entries = discover(self)
         self.funcs = funcs
         self.func_starts = [a for a, _ in funcs]
         self.func_set = set(self.func_starts)
@@ -115,6 +158,8 @@ class Program:
         self.tramps = {}              # loader trampoline address -> import address
         self.data_code_refs = set()   # code addresses stored in data (vtables, jump tables, fn pointers)
         self.code_addr_refs = set()   # code addresses materialised in code via lis/addi
+        self.data_import_aliases = {}
+        halves = collections.defaultdict(lambda: collections.defaultdict(set))
         for s in secs:
             if s.type != 4:  # RELA
                 continue
@@ -124,6 +169,14 @@ class Program:
                 off, info, addend = struct.unpack_from(">IIi", d, o)
                 t = info & 0xFF
                 tgt = target(info, addend)
+                base = (tgt - addend) & 0xFFFFFFFF
+                if base in self.imports and self.imports[base][2] == 'data':
+                    pos = off - target_sec.addr
+                    if t == R_PPC_ADDR32:
+                        stored = struct.unpack_from('>I', target_sec.data, pos)[0]
+                        self.data_import_aliases[(stored - addend) & 0xFFFFFFFF] = base
+                    elif t in (R_PPC_ADDR16_HA, R_PPC_ADDR16_LO):
+                        halves[base, addend][t].add(struct.unpack_from('>H', target_sec.data, pos)[0])
                 if target_sec is self.text and t == R_PPC_REL24:
                     self.rel24[off] = tgt
                     if tgt in self.imports:
@@ -139,6 +192,24 @@ class Program:
                 elif t == R_PPC_ADDR32 and tgt in self.imports and target_sec.type == 1:
                     stored = struct.unpack_from(">I", target_sec.data, off - target_sec.addr)[0]
                     self.tramps[stored] = tgt
+        for (base, addend), parts in halves.items():
+            highs, lows = parts[R_PPC_ADDR16_HA], parts[R_PPC_ADDR16_LO]
+            if not highs or not lows:
+                continue  # another use of this symbol can provide the full pair
+            if len(highs) != 1 or len(lows) != 1:
+                raise ValueError('ambiguous data import relocation for %s' % self.imports[base][1])
+            hi, lo = next(iter(highs)), next(iter(lows))
+            alias = ((hi << 16) + (lo if lo < 0x8000 else lo - 0x10000) - addend) & 0xFFFFFFFF
+            self.data_import_aliases[alias] = base
+
+
+def write_data_imports(p, out):
+    with open(os.path.join(out, 'data_imports.c'), 'w') as fo:
+        fo.write('#include <stdint.h>\n#include <stddef.h>\n')
+        fo.write('const struct { uint32_t addr; const char *name; } g_data_aliases[] = {\n')
+        for alias, base in sorted(p.data_import_aliases.items()):
+            fo.write(' {0x%Xu, "%s"},\n' % (alias, p.imports[base][1]))
+        fo.write(' {0, 0}\n};\nconst size_t g_data_alias_count = %d;\n' % len(p.data_import_aliases))
 
 
 def fn_name(a):
@@ -154,10 +225,13 @@ class FuncEmitter:
         labs = set()
         for a in range(self.start, self.end, 4):
             b = insn.branch_info(self.p.word(a), a)
-            if b and b["kind"] == "b" and a not in self.p.rel24 and self.start <= b["target"] < self.end:
-                labs.add(b["target"])
+            if b and b["kind"] == "b":
+                tgt = self.p.rel24.get(a, b["target"])
+                if self.start <= tgt < self.end:
+                    labs.add(tgt)
         # In-function code addresses referenced from data or code: jump-table targets.
-        jt = {t for t in (self.p.data_code_refs | self.p.code_addr_refs) if self.start < t < self.end}
+        refs = self.p.sorted_code_refs
+        jt = set(refs[bisect.bisect_right(refs, self.start):bisect.bisect_left(refs, self.end)])
         # Branch tables: `switch` lowered to bctr into a run of unconditional `b` instructions,
         # where only the table base is ever referenced. Every entry is a potential target.
         run = []
@@ -283,6 +357,10 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--per-file", type=int, default=1500)
     a = ap.parse_args()
+    if a.per_file < 1:
+        ap.error('--per-file must be positive')
+    if Path(a.out).resolve().is_relative_to(Path(__file__).resolve().parent.parent):
+        ap.error('generated game data must be written outside the toolkit repository')
     p = Program(a.rpx)
     os.makedirs(a.out, exist_ok=True)
     report = collections.defaultdict(list)
@@ -328,6 +406,8 @@ def main():
             fo.write("\n%s: %d\n" % (k, len(v)))
             for line in v[:200]:
                 fo.write("  %s\n" % line)
+    write_build(a.out, nfiles)
+    write_data_imports(p, a.out)
     print("functions: %d (+%d extra entry points), files: %d" % (len(p.funcs), len(p.entry_set), nfiles))
     for k, v in sorted(report.items()):
         print("  %s: %d" % (k, len(v)))
