@@ -300,7 +300,7 @@ def c_run(lib, idx, st, mem, membuf):
 KNOWN_ORACLE_BUGS = collections.Counter()
 
 
-def compare(w, a, b):
+def compare(w, a, b, st):
     diffs = []
     op, f = w >> 26, insn.F(w)
     fmask = 0xFFFFFFFFFFFFFFFF
@@ -313,7 +313,7 @@ def compare(w, a, b):
             a["f"][f.frd] = b["f"][f.frd]
     if op == 31 and f.xo9 in (491, 459) and a["r"][f.rd] != b["r"][f.rd]:
         # Divide by zero / overflow is undefined in the ISA; we follow Cemu (and Dolphin).
-        divisor, dividend = b["r"][f.rb], b["r"][f.ra]
+        divisor, dividend = st["r"][f.rb], st["r"][f.ra]
         if divisor == 0 or (dividend == 0x80000000 and divisor == 0xFFFFFFFF):
             KNOWN_ORACLE_BUGS["divide undefined case (follows Cemu)"] += 1
             a = dict(a, r=list(a["r"]))
@@ -404,7 +404,7 @@ def main():
                 break
             ca = c_run(lib, idx, st, mem, membuf)
             runs += 1
-            d = compare(w, ua, ca)
+            d = compare(w, ua, ca, st)
             if d:
                 fails[name].append((w, "; ".join(d[:4]) + " | in: " + inputs_str(w, st)))
     total_fail = sum(len(v) for v in fails.values())

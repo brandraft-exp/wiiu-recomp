@@ -112,6 +112,7 @@ class Program:
             return (v + addend) & 0xFFFFFFFF
 
         self.rel24 = {}
+        self.tramps = {}              # loader trampoline address -> import address
         self.data_code_refs = set()   # code addresses stored in data (vtables, jump tables, fn pointers)
         self.code_addr_refs = set()   # code addresses materialised in code via lis/addi
         for s in secs:
@@ -125,11 +126,19 @@ class Program:
                 tgt = target(info, addend)
                 if target_sec is self.text and t == R_PPC_REL24:
                     self.rel24[off] = tgt
+                    if tgt in self.imports:
+                        w = self.word(off)
+                        li = w & 0x03FFFFFC
+                        li = li - 0x04000000 if li & 0x02000000 else li
+                        self.tramps[(off + li) & 0xFFFFFFFF] = tgt
                 elif target_sec is self.text and t == R_PPC_ADDR16_LO:
                     if self.lo <= tgt < self.hi:
                         self.code_addr_refs.add(tgt)
                 elif t == R_PPC_ADDR32 and self.lo <= tgt < self.hi:
                     self.data_code_refs.add(tgt)
+                elif t == R_PPC_ADDR32 and tgt in self.imports and target_sec.type == 1:
+                    stored = struct.unpack_from(">I", target_sec.data, off - target_sec.addr)[0]
+                    self.tramps[stored] = tgt
 
 
 def fn_name(a):
@@ -148,8 +157,19 @@ class FuncEmitter:
             if b and b["kind"] == "b" and a not in self.p.rel24 and self.start <= b["target"] < self.end:
                 labs.add(b["target"])
         # In-function code addresses referenced from data or code: jump-table targets.
-        self.jt = sorted(t for t in (self.p.data_code_refs | self.p.code_addr_refs)
-                         if self.start < t < self.end)
+        jt = {t for t in (self.p.data_code_refs | self.p.code_addr_refs) if self.start < t < self.end}
+        # Branch tables: `switch` lowered to bctr into a run of unconditional `b` instructions,
+        # where only the table base is ever referenced. Every entry is a potential target.
+        run = []
+        for a in range(self.start, self.end + 4, 4):
+            w = self.p.word(a) if a < self.end else 0
+            if (w >> 26) == 18 and not (w & 3):
+                run.append(a)
+                continue
+            if len(run) >= 3:
+                jt.update(run)
+            run = []
+        self.jt = sorted(jt)
         labs.update(self.jt)
         return labs
 
@@ -296,6 +316,11 @@ def main():
             lib, name, kind = p.imports[addr]
             fo.write(' {0x%Xu, "%s", "%s", %d},\n' % (addr, lib, name, kind == "data"))
         fo.write("};\nconst size_t g_import_count = %d;\n" % len(p.imports))
+        fo.write("/* loader trampolines (pre-relocated pointers to imports) -> import index */\n")
+        fo.write("const struct { uint32_t addr; int id; } g_tramps[] = {\n")
+        for t in sorted(p.tramps):
+            fo.write(" {0x%Xu, %d},\n" % (t, p.import_ids[p.tramps[t]]))
+        fo.write("};\nconst size_t g_tramp_count = %d;\n" % len(p.tramps))
 
     with open(os.path.join(a.out, "report.txt"), "w") as fo:
         fo.write("functions: %d in %d files\n" % (len(p.funcs), nfiles))
