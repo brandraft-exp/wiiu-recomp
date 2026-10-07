@@ -404,3 +404,14 @@ Next graphics work:
   further missing GPU or OS behavior.
 - Latest checks: all 30 regression tests passed, with a subsequent targeted pass
   for the strengthened render-target reuse test. No instruction semantics changed.
+
+
+## User performance baseline
+
+- User screenshot after the village transition shows 8.3 presented FPS at
+  1920×1080, with 120.7 ms average and 146.1 ms maximum frame interval.
+  Frame counter 2019, VPAD reads 2020. The window was unfocused at capture.
+- The character is visible at a different village position with the normal HUD.
+  Next session should profile active play before optimizing. Shader translation
+  currently runs for each draw in `validate_draw`; measure its share alongside
+  texture upload, draw, and presentation costs using `WIIU_TRACE_GPU=1`.
